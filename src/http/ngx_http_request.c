@@ -3,12 +3,21 @@
  * Copyright (C) Igor Sysoev
  * Copyright (C) Nginx, Inc.
  */
+/*
+** This version is modified to support rewinding capability
+** © Ericsson AB 2022-2023
+** 
+** SPDX-License-Identifier: BSD 3-Clause
+** 
+*/
+
 
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-
+#include "../../../../secure-rewind-and-discard/src/sdrad_api.h"
+#include "ngx_http_parse_wrap.h"
 
 static void ngx_http_wait_request_handler(ngx_event_t *ev);
 static ngx_http_request_t *ngx_http_alloc_request(ngx_connection_t *c);
@@ -382,123 +391,131 @@ ngx_http_wait_request_handler(ngx_event_t *rev)
     ngx_connection_t          *c;
     ngx_http_connection_t     *hc;
     ngx_http_core_srv_conf_t  *cscf;
+    int                       sdr_err;
 
-    c = rev->data;
+    sdr_err = sdrad_init(NGX_NESTED_DOMAIN, SDRAD_EXECUTION_DOMAIN | SDRAD_NONISOLATED_DOMAIN | SDRAD_RETURN_TO_CURRENT); 
+    if(sdr_err == SDRAD_SUCCESSFUL_RETURNED || sdr_err == SDRAD_WARNING_SAVE_EC) {     
+  
+        c = rev->data;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http wait request handler");
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http wait request handler");
 
-    if (rev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "client timed out");
-        ngx_http_close_connection(c);
-        return;
-    }
+        if (rev->timedout) {
+            ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "client timed out");
+            ngx_http_close_connection(c);
+            return;
+        }
 
-    if (c->close) {
-        ngx_http_close_connection(c);
-        return;
-    }
+        if (c->close) {
+            ngx_http_close_connection(c);
+            return;
+        }
 
-    hc = c->data;
-    cscf = ngx_http_get_module_srv_conf(hc->conf_ctx, ngx_http_core_module);
+        hc = c->data;
+        cscf = ngx_http_get_module_srv_conf(hc->conf_ctx, ngx_http_core_module);
 
-    size = cscf->client_header_buffer_size;
+        size = cscf->client_header_buffer_size;
 
-    b = c->buffer;
+        b = c->buffer;
 
-    if (b == NULL) {
-        b = ngx_create_temp_buf(c->pool, size);
         if (b == NULL) {
-            ngx_http_close_connection(c);
-            return;
-        }
+            b = ngx_create_temp_buf(c->pool, size);
+            if (b == NULL) {
+                ngx_http_close_connection(c);
+                return;
+            }
 
-        c->buffer = b;
+            c->buffer = b;
 
-    } else if (b->start == NULL) {
+        } else if (b->start == NULL) {
 
-        b->start = ngx_palloc(c->pool, size);
-        if (b->start == NULL) {
-            ngx_http_close_connection(c);
-            return;
-        }
+            b->start = ngx_palloc(c->pool, size);
+            if (b->start == NULL) {
+                ngx_http_close_connection(c);
+                return;
+            }
 
-        b->pos = b->start;
-        b->last = b->start;
-        b->end = b->last + size;
-    }
-
-    n = c->recv(c, b->last, size);
-
-    if (n == NGX_AGAIN) {
-
-        if (!rev->timer_set) {
-            ngx_add_timer(rev, cscf->client_header_timeout);
-            ngx_reusable_connection(c, 1);
-        }
-
-        if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-            ngx_http_close_connection(c);
-            return;
-        }
-
-        /*
-         * We are trying to not hold c->buffer's memory for an idle connection.
-         */
-
-        if (ngx_pfree(c->pool, b->start) == NGX_OK) {
-            b->start = NULL;
-        }
-
-        return;
-    }
-
-    if (n == NGX_ERROR) {
-        ngx_http_close_connection(c);
-        return;
-    }
-
-    if (n == 0) {
-        ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                      "client closed connection");
-        ngx_http_close_connection(c);
-        return;
-    }
-
-    b->last += n;
-
-    if (hc->proxy_protocol) {
-        hc->proxy_protocol = 0;
-
-        p = ngx_proxy_protocol_read(c, b->pos, b->last);
-
-        if (p == NULL) {
-            ngx_http_close_connection(c);
-            return;
-        }
-
-        b->pos = p;
-
-        if (b->pos == b->last) {
-            c->log->action = "waiting for request";
             b->pos = b->start;
             b->last = b->start;
-            ngx_post_event(rev, &ngx_posted_events);
+            b->end = b->last + size;
+        }
+
+        n = c->recv(c, b->last, size);
+
+        if (n == NGX_AGAIN) {
+
+            if (!rev->timer_set) {
+                ngx_add_timer(rev, cscf->client_header_timeout);
+                ngx_reusable_connection(c, 1);
+            }
+
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_http_close_connection(c);
+                return;
+            }
+
+            /*
+            * We are trying to not hold c->buffer's memory for an idle connection.
+            */
+
+            if (ngx_pfree(c->pool, b->start) == NGX_OK) {
+                b->start = NULL;
+            }
+
             return;
         }
-    }
 
-    c->log->action = "reading client request line";
+        if (n == NGX_ERROR) {
+            ngx_http_close_connection(c);
+            return;
+        }
 
-    ngx_reusable_connection(c, 0);
+        if (n == 0) {
+            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                        "client closed connection");
+            ngx_http_close_connection(c);
+            return;
+        }
 
-    c->data = ngx_http_create_request(c);
-    if (c->data == NULL) {
+        b->last += n;
+
+        if (hc->proxy_protocol) {
+            hc->proxy_protocol = 0;
+
+            p = ngx_proxy_protocol_read(c, b->pos, b->last);
+
+            if (p == NULL) {
+                ngx_http_close_connection(c);
+                return;
+            }
+
+            b->pos = p;
+
+            if (b->pos == b->last) {
+                c->log->action = "waiting for request";
+                b->pos = b->start;
+                b->last = b->start;
+                ngx_post_event(rev, &ngx_posted_events);
+                return;
+            }
+        }
+
+        c->log->action = "reading client request line";
+
+        ngx_reusable_connection(c, 0);
+
+        c->data = ngx_http_create_request(c);
+        if (c->data == NULL) {
+            ngx_http_close_connection(c);
+            return;
+        }
+
+        rev->handler = ngx_http_process_request_line;
+        ngx_http_process_request_line(rev);
+        sdrad_deinit(NGX_NESTED_DOMAIN);
+    } else {
         ngx_http_close_connection(c);
-        return;
     }
-
-    rev->handler = ngx_http_process_request_line;
-    ngx_http_process_request_line(rev);
 }
 
 
@@ -548,7 +565,13 @@ ngx_http_alloc_request(ngx_connection_t *c)
 
     cscf = ngx_http_get_module_srv_conf(hc->conf_ctx, ngx_http_core_module);
 
-    pool = ngx_create_pool(cscf->request_pool_size, c->log);
+    if(data_domain_flag == 0){
+        sdrad_init(NGX_DATA_DOMAIN, SDRAD_DATA_DOMAIN | SDRAD_NONISOLATED_DOMAIN | SDRAD_RETURN_TO_CURRENT); 
+        data_domain_flag = 1; 
+    }
+
+    pool = __ngx_create_pool(NGX_DATA_DOMAIN, cscf->request_pool_size, c->log);
+
     if (pool == NULL) {
         return NULL;
     }
@@ -3707,7 +3730,7 @@ ngx_http_free_request(ngx_http_request_t *r, ngx_int_t rc)
     pool = r->pool;
     r->pool = NULL;
 
-    ngx_destroy_pool(pool);
+    __ngx_destroy_pool(pool);
 }
 
 
